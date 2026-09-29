@@ -1,21 +1,17 @@
-export type Role = "buyer" | "seller";
+import type * as schema from "@/db/schema";
+
 export type SellerType = "individual" | "company";
 
-export interface Location {
-  city: string;
-  state: string;
-}
+export type SellerProfile = typeof schema.sellerProfile.$inferSelect;
 
+/** Every signed-in account can buy. `seller` is set once they opt in to selling. */
 export interface User {
   id: string;
   name: string;
-  role: Role;
-  sellerType?: SellerType;
-  /** Shown instead of `name` on offers when the seller is a company. */
-  businessName?: string;
-  location: Location;
-  /** Seller alert keywords, matched against a want's card name and set. */
-  interests?: string[];
+  email: string;
+  city: string;
+  state: string;
+  seller: SellerProfile | null;
 }
 
 export const RAW_CONDITIONS = [
@@ -37,60 +33,8 @@ export type WantStatus = "open" | "pending" | "sold" | "no_deal";
 
 export type Scope = "local" | "nationwide";
 
-export interface Want {
-  id: string;
-  buyerId: string;
-  cardName: string;
-  setName: string;
-  cardNumber?: string;
-  description: string;
-  /** Buyer's own uploaded photo. */
-  imagePath?: string;
-  /** Linked TCGdex card: official image base URL, rarity and raw market price at post time. */
-  tcgCardId?: string;
-  officialImage?: string;
-  rarity?: string;
-  marketPrice?: number;
-  condition: CardCondition;
-  priceMin: number;
-  priceMax: number;
-  scope: Scope;
-  location: Location;
-  status: WantStatus;
-  acceptedOfferId?: string;
-  closedReason?: "sold" | "buyer_closed" | "expired";
-  createdAt: string;
-  expiresAt: string;
-  closedAt?: string;
-}
-
 export type Fulfillment = "ship" | "local";
 
-export interface Offer {
-  id: string;
-  wantId: string;
-  sellerId: string;
-  price: number;
-  shipping: number;
-  fulfillment: Fulfillment;
-  message: string;
-  createdAt: string;
-  /** Set when the seller posts a newer offer on the same want. Old offers stay public. */
-  supersededAt?: string;
-}
-
-export interface Alert {
-  id: string;
-  sellerId: string;
-  wantId: string;
-  matchedOn: string;
-  createdAt: string;
-  read: boolean;
-}
-
-export interface Database {
-  users: User[];
-  wants: Want[];
-  offers: Offer[];
-  alerts: Alert[];
-}
+export type Want = typeof schema.want.$inferSelect;
+export type Offer = typeof schema.offer.$inferSelect;
+export type Alert = typeof schema.alert.$inferSelect;

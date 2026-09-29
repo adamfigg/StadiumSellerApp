@@ -1,4 +1,4 @@
-import type { CardCondition, Offer, User, WantStatus } from "./types";
+import type { CardCondition, Offer, SellerProfile, WantStatus } from "./types";
 
 export const money = (n: number) =>
   n.toLocaleString("en-US", {
@@ -10,10 +10,15 @@ export const money = (n: number) =>
 export const conditionLabel = (c: CardCondition) =>
   c.kind === "raw" ? `Raw · ${c.condition}` : `${c.company} ${c.grade}`;
 
-export const displayName = (u?: User) =>
-  !u ? "Unknown" : u.sellerType === "company" && u.businessName ? u.businessName : u.name;
+/** A company seller's business name, otherwise the person's name. */
+export const displayName = (u?: { name: string; seller?: SellerProfile | null } | null) =>
+  !u ? "Unknown" : u.seller?.sellerType === "company" && u.seller.businessName ? u.seller.businessName : u.name;
 
-export const offerTotal = (o: Offer) => o.price + o.shipping;
+export const offerTotal = (o: Pick<Offer, "price" | "shipping">) => o.price + o.shipping;
+
+/** Offer ranking everywhere: cheapest delivered total first; on a tie, whoever offered first. */
+export const rankOffers = (a: Pick<Offer, "price" | "shipping" | "createdAt">, b: Pick<Offer, "price" | "shipping" | "createdAt">) =>
+  offerTotal(a) - offerTotal(b) || new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
 
 export const STATUS_LABEL: Record<WantStatus, string> = {
   open: "Open — looking",
@@ -22,8 +27,8 @@ export const STATUS_LABEL: Record<WantStatus, string> = {
   no_deal: "Closed — no deal",
 };
 
-export function timeAgo(iso: string) {
-  const diff = Date.now() - Date.parse(iso);
+export function timeAgo(when: Date | string) {
+  const diff = Date.now() - new Date(when).getTime();
   const m = Math.round(diff / 60_000);
   if (m < 1) return "just now";
   if (m < 60) return `${m}m ago`;
@@ -32,8 +37,8 @@ export function timeAgo(iso: string) {
   return `${Math.round(h / 24)}d ago`;
 }
 
-export function timeLeft(iso: string) {
-  const diff = Date.parse(iso) - Date.now();
+export function timeLeft(when: Date | string) {
+  const diff = new Date(when).getTime() - Date.now();
   if (diff <= 0) return "ended";
   const h = Math.floor(diff / 3_600_000);
   if (h < 1) return `${Math.max(1, Math.round(diff / 60_000))}m left`;

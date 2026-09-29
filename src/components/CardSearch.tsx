@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { ZoomImage } from "./ZoomImage";
 
 export interface PickedCard {
   id: string;
@@ -86,9 +87,9 @@ export function CardSearch({ onPick }: { onPick: (card: PickedCard) => void }) {
                 disabled={!!picking}
                 className="group w-full text-left disabled:opacity-60"
               >
-                {/* eslint-disable-next-line @next/next/no-img-element -- TCGdex CDN thumbnails */}
-                <img
+                <ZoomImage
                   src={`${c.image}/low.webp`}
+                  zoomSrc={`${c.image}/high.webp`}
                   alt={`${c.name} ${c.setName} ${c.number}`}
                   loading="lazy"
                   className={`aspect-[5/7] w-full rounded-md object-cover shadow-sm transition group-hover:ring-2 group-hover:ring-brand ${

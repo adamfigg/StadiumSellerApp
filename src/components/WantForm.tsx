@@ -4,13 +4,13 @@ import { useActionState, useState } from "react";
 import { createWant } from "@/app/actions";
 import { GRADING_COMPANIES, RAW_CONDITIONS } from "@/lib/types";
 import { CardSearch, type PickedCard } from "./CardSearch";
+import { ZoomImage } from "./ZoomImage";
 
 const usd = (n: number) => n.toLocaleString("en-US", { style: "currency", currency: "USD" });
 
 export function WantForm({ location }: { location: string }) {
   const [state, action, pending] = useActionState(createWant, undefined);
   const [kind, setKind] = useState<"raw" | "graded">("raw");
-  const [preview, setPreview] = useState<string>();
   const [card, setCard] = useState<PickedCard>();
   const [fields, setFields] = useState({ cardName: "", setName: "", cardNumber: "" });
   const field = (key: keyof typeof fields) => ({
@@ -34,8 +34,12 @@ export function WantForm({ location }: { location: string }) {
           </div>
           {card ? (
             <div className="flex items-center gap-4">
-              {/* eslint-disable-next-line @next/next/no-img-element -- TCGdex CDN */}
-              <img src={`${card.image}/low.webp`} alt={card.name} className="w-16 rounded-md shadow-sm" />
+              <ZoomImage
+                src={`${card.image}/low.webp`}
+                zoomSrc={`${card.image}/high.webp`}
+                alt={card.name}
+                className="w-16 rounded-md shadow-sm"
+              />
               <div className="min-w-0 flex-1 text-sm">
                 <div className="font-medium">{card.name}</div>
                 <div className="text-ink-muted">
@@ -159,28 +163,18 @@ export function WantForm({ location }: { location: string }) {
       </div>
 
       <div>
-        <span className="label">Photo</span>
-        {card && !preview && (
-          <p className="mb-2 text-xs text-ink-muted">Official image. Click to add your own photo too.</p>
-        )}
-        <label className="flex aspect-[5/7] cursor-pointer items-center justify-center overflow-hidden rounded-lg border-2 border-dashed border-line bg-surface text-center text-sm text-ink-muted hover:border-brand">
-          {preview || card ? (
-            // eslint-disable-next-line @next/next/no-img-element -- local object URL or TCGdex image
-            <img src={preview ?? `${card!.image}/high.webp`} alt="Selected card" className="h-full w-full object-cover" />
-          ) : (
-            <span className="px-4">Add a reference photo (JPG, PNG, WebP · 5 MB)</span>
-          )}
-          <input
-            type="file"
-            name="photo"
-            accept="image/jpeg,image/png,image/webp"
-            className="sr-only"
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              setPreview(f ? URL.createObjectURL(f) : undefined);
-            }}
+        <span className="label">Card image</span>
+        {card ? (
+          <ZoomImage
+            src={`${card.image}/high.webp`}
+            alt={card.name}
+            className="aspect-[5/7] w-full rounded-lg object-cover shadow-sm"
           />
-        </label>
+        ) : (
+          <div className="flex aspect-[5/7] items-center justify-center rounded-lg border-2 border-dashed border-line bg-surface px-4 text-center text-sm text-ink-muted">
+            Pick a card from search to show its official image
+          </div>
+        )}
       </div>
     </form>
   );

@@ -40,5 +40,9 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# local data store (JSON db + uploaded photos)
+# local data (PGlite database in data/pglite)
 /data/
+/data-backup/
+
+# example env is safe to commit
+!.env.example

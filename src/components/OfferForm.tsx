@@ -7,10 +7,13 @@ export function OfferForm({
   wantId,
   lowestTotal,
   hasOffer,
+  youAreLowest = false,
 }: {
   wantId: string;
   lowestTotal?: string;
   hasOffer: boolean;
+  /** The viewer's own offer is currently the lowest. */
+  youAreLowest?: boolean;
 }) {
   const [state, action, pending] = useActionState(createOffer, undefined);
   const [fulfillment, setFulfillment] = useState<"ship" | "local">("ship");
@@ -21,7 +24,9 @@ export function OfferForm({
       <div>
         <h2 className="font-semibold">{hasOffer ? "Revise your offer" : "Make an offer"}</h2>
         <p className="text-sm text-ink-muted">
-          {lowestTotal
+          {youAreLowest
+            ? `You have the lowest offer at ${lowestTotal} delivered. Anyone can still undercut it.`
+            : lowestTotal
             ? `Lowest offer right now is ${lowestTotal} delivered. Everyone can see what you post.`
             : "No offers yet — set the bar. Everyone can see what you post."}
         </p>

@@ -1,46 +1,63 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { readDb } from "@/lib/db";
+import { eq } from "drizzle-orm";
+import * as s from "@/db/schema";
+import { db, expireWants } from "@/lib/db";
 import { getCurrentUser } from "@/lib/session";
-import { conditionLabel, displayName, money, offerTotal, timeAgo, timeLeft } from "@/lib/format";
+import { conditionLabel, displayName, money, offerTotal, rankOffers, timeAgo, timeLeft } from "@/lib/format";
 import { CardArt, ScopeBadge, StatusBadge } from "@/components/ui";
 import { OfferForm } from "@/components/OfferForm";
+import { SignUpGate } from "@/components/SignUpGate";
+import { RecordView } from "@/components/RecentHistory";
 import { acceptOffer, closeNoDeal, markSold, reopenWant } from "@/app/actions";
 
 export default async function WantPage({ params }: PageProps<"/wants/[id]">) {
   const { id } = await params;
-  const [db, user] = await Promise.all([readDb(), getCurrentUser()]);
-  const want = db.wants.find((w) => w.id === id);
-  if (!want) notFound();
+  const [user] = await Promise.all([getCurrentUser(), expireWants()]);
+  const [row] = await db
+    .select({ want: s.want, buyerName: s.user.name })
+    .from(s.want)
+    .innerJoin(s.user, eq(s.user.id, s.want.buyerId))
+    .where(eq(s.want.id, id));
+  if (!row) notFound();
+  const { want, buyerName } = row;
 
-  const buyer = db.users.find((u) => u.id === want.buyerId);
-  const isOwner = user.id === want.buyerId;
-  const allOffers = db.offers.filter((o) => o.wantId === want.id);
-  const active = allOffers.filter((o) => !o.supersededAt).sort((a, b) => offerTotal(a) - offerTotal(b));
+  const allOffers = await db
+    .select({ offer: s.offer, name: s.user.name, city: s.user.city, state: s.user.state, seller: s.sellerProfile })
+    .from(s.offer)
+    .innerJoin(s.user, eq(s.user.id, s.offer.sellerId))
+    .leftJoin(s.sellerProfile, eq(s.sellerProfile.userId, s.offer.sellerId))
+    .where(eq(s.offer.wantId, want.id));
+
+  const isOwner = user?.id === want.buyerId;
+  const active = allOffers.filter((r) => !r.offer.supersededAt).sort((a, b) => rankOffers(a.offer, b.offer));
   const history = allOffers
-    .filter((o) => o.supersededAt)
-    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
-  const lowest = active[0];
-  const accepted = allOffers.find((o) => o.id === want.acceptedOfferId);
-  const seller = (sid: string) => db.users.find((u) => u.id === sid);
-  const myOffer = active.find((o) => o.sellerId === user.id);
+    .filter((r) => r.offer.supersededAt)
+    .sort((a, b) => b.offer.createdAt.getTime() - a.offer.createdAt.getTime());
+  const lowest = active[0]?.offer;
+  const accepted = allOffers.find((r) => r.offer.id === want.acceptedOfferId);
+  const myOffer = active.find((r) => r.offer.sellerId === user?.id);
+  const iHaveBest = !!lowest && lowest.sellerId === user?.id && lowest.id !== want.acceptedOfferId;
+  const offerForm = (
+    <OfferForm
+      wantId={want.id}
+      hasOffer={!!myOffer}
+      lowestTotal={lowest ? money(offerTotal(lowest)) : undefined}
+      youAreLowest={iHaveBest}
+    />
+  );
 
   return (
     <div className="space-y-8">
+      {/* version changes when offers or status change, so the history panel refreshes */}
+      <RecordView wantId={want.id} version={`${want.status}:${active.map((r) => r.offer.id).join(",")}`} />
       <Link href="/" className="text-sm text-ink-muted hover:text-ink">
         ← All wants
       </Link>
 
       <section className="grid gap-8 md:grid-cols-[240px_1fr]">
-        <div className="space-y-3">
+        <div>
           <CardArt want={want} />
-          {want.officialImage && want.imagePath && (
-            <div>
-              <p className="mb-1 text-xs text-ink-muted">Buyer&apos;s reference photo</p>
-              {/* eslint-disable-next-line @next/next/no-img-element -- local upload */}
-              <img src={want.imagePath} alt="Buyer's photo" className="w-24 rounded-md" />
-            </div>
-          )}
         </div>
         <div className="space-y-5">
           <div className="flex flex-wrap items-center gap-2">
@@ -64,16 +81,9 @@ export default async function WantPage({ params }: PageProps<"/wants/[id]">) {
           <dl className="grid grid-cols-2 gap-4 sm:grid-cols-5">
             <Stat label="Quality" value={conditionLabel(want.condition)} />
             <Stat label="Budget" value={`${money(want.priceMin)}–${money(want.priceMax)}`} />
-            <Stat
-              label="Lowest offer"
-              value={lowest ? money(offerTotal(lowest)) : "—"}
-              accent={!!lowest}
-            />
-            <Stat
-              label="Market (ungraded)"
-              value={want.marketPrice !== undefined ? money(want.marketPrice) : "—"}
-            />
-            <Stat label="Posted by" value={`${buyer?.name ?? "Buyer"} · ${timeAgo(want.createdAt)}`} />
+            <Stat label="Lowest offer" value={lowest ? money(offerTotal(lowest)) : "—"} accent={!!lowest} />
+            <Stat label="Market (ungraded)" value={want.marketPrice != null ? money(want.marketPrice) : "—"} />
+            <Stat label="Posted by" value={`${buyerName} · ${timeAgo(want.createdAt)}`} />
           </dl>
           {want.description && <p className="max-w-2xl whitespace-pre-line">{want.description}</p>}
 
@@ -92,8 +102,7 @@ export default async function WantPage({ params }: PageProps<"/wants/[id]">) {
               {want.status === "pending" && accepted && (
                 <>
                   <span className="text-sm text-ink-muted">
-                    Deal in progress with {displayName(seller(accepted.sellerId))} at{" "}
-                    {money(offerTotal(accepted))}.
+                    Deal in progress with {displayName(accepted)} at {money(offerTotal(accepted.offer))}.
                   </span>
                   <div className="ml-auto flex flex-wrap gap-2">
                     <form action={markSold}>
@@ -128,18 +137,28 @@ export default async function WantPage({ params }: PageProps<"/wants/[id]">) {
             <div className="panel p-8 text-center text-ink-muted">No offers yet.</div>
           ) : (
             <ol className="space-y-3">
-              {active.map((o, i) => {
-                const s = seller(o.sellerId);
+              {active.map((r, i) => {
+                const o = r.offer;
                 const isAccepted = o.id === want.acceptedOfferId;
+                const isBest = i === 0 && !isAccepted;
+                const isMineBest = isBest && o.sellerId === user?.id;
                 return (
                   <li
                     key={o.id}
                     className={`panel flex flex-wrap items-start gap-4 p-4 ${
-                      isAccepted ? "border-pending ring-2 ring-pending/20" : i === 0 ? "border-open" : ""
+                      isAccepted
+                        ? "border-pending ring-2 ring-pending/20"
+                        : isMineBest
+                          ? "best-offer best-offer-mine"
+                          : isBest
+                            ? "best-offer"
+                            : ""
                     }`}
                   >
                     <div className="w-24 shrink-0">
-                      <div className="text-xl font-semibold tabular-nums">{money(offerTotal(o))}</div>
+                      <div className={`text-xl font-semibold tabular-nums ${isMineBest ? "text-gold-ink" : isBest ? "text-open" : ""}`}>
+                        {money(offerTotal(o))}
+                      </div>
                       <div className="text-xs text-ink-muted">
                         {o.fulfillment === "local"
                           ? "local meetup"
@@ -150,13 +169,24 @@ export default async function WantPage({ params }: PageProps<"/wants/[id]">) {
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-medium">{displayName(s)}</span>
-                        {s?.sellerType === "company" && (
+                        <span className="font-medium">{displayName(r)}</span>
+                        {r.seller?.sellerType === "company" && (
                           <span className="rounded bg-surface-2 px-1.5 text-xs text-ink-muted">Shop</span>
                         )}
-                        {i === 0 && !isAccepted && (
-                          <span className="rounded bg-open-soft px-1.5 text-xs font-medium text-open">
-                            Lowest
+                        {isMineBest && (
+                          <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded bg-gold px-1.5 text-xs font-semibold text-ink">
+                            <svg viewBox="0 0 12 12" className="size-3" aria-hidden>
+                              <path d="M1 9.5h10L10 3 7.5 5.5 6 1.5 4.5 5.5 2 3z" fill="currentColor" />
+                            </svg>
+                            Your offer is the best
+                          </span>
+                        )}
+                        {isBest && !isMineBest && (
+                          <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded bg-open px-1.5 text-xs font-medium text-surface">
+                            <svg viewBox="0 0 12 12" className="size-3" aria-hidden>
+                              <path d="M6 0l1.4 4.6L12 6l-4.6 1.4L6 12l-1.4-4.6L0 6l4.6-1.4z" fill="currentColor" />
+                            </svg>
+                            Best offer
                           </span>
                         )}
                         {isAccepted && (
@@ -165,7 +195,7 @@ export default async function WantPage({ params }: PageProps<"/wants/[id]">) {
                           </span>
                         )}
                         <span className="text-xs text-ink-muted">
-                          {s?.location.city}, {s?.location.state} · {timeAgo(o.createdAt)}
+                          {r.city}, {r.state} · {timeAgo(o.createdAt)}
                         </span>
                       </div>
                       {o.message && <p className="mt-1 text-sm">{o.message}</p>}
@@ -189,10 +219,10 @@ export default async function WantPage({ params }: PageProps<"/wants/[id]">) {
                 Earlier offers ({history.length})
               </summary>
               <ul className="mt-2 space-y-1 text-sm text-ink-muted">
-                {history.map((o) => (
-                  <li key={o.id}>
-                    <span className="line-through">{money(offerTotal(o))}</span> from{" "}
-                    {displayName(seller(o.sellerId))} · {timeAgo(o.createdAt)}, since revised
+                {history.map((r) => (
+                  <li key={r.offer.id}>
+                    <span className="line-through">{money(offerTotal(r.offer))}</span> from {displayName(r)} ·{" "}
+                    {timeAgo(r.offer.createdAt)}, since revised
                   </li>
                 ))}
               </ul>
@@ -201,19 +231,23 @@ export default async function WantPage({ params }: PageProps<"/wants/[id]">) {
         </div>
 
         <aside>
-          {user.role === "seller" && want.status === "open" ? (
-            <OfferForm
-              wantId={want.id}
-              hasOffer={!!myOffer}
-              lowestTotal={lowest ? money(offerTotal(lowest)) : undefined}
-            />
-          ) : user.role === "seller" ? (
-            <div className="panel p-5 text-sm text-ink-muted">This post isn&apos;t taking offers.</div>
-          ) : !isOwner ? (
-            <div className="panel p-5 text-sm text-ink-muted">
-              Switch to a seller account in the header to make an offer.
+          {want.status !== "open" ? (
+            !isOwner && <div className="panel p-5 text-sm text-ink-muted">This post isn&apos;t taking offers.</div>
+          ) : !user ? (
+            <SignUpGate>{offerForm}</SignUpGate>
+          ) : isOwner ? null : user.seller ? (
+            offerForm
+          ) : (
+            <div className="panel space-y-3 p-5">
+              <h2 className="font-semibold">Have this card?</h2>
+              <p className="text-sm text-ink-muted">
+                Set up your seller profile to make offers. It takes a minute, and nothing changes about how you buy.
+              </p>
+              <Link href={`/seller/setup?next=/wants/${want.id}`} className="btn-primary">
+                Set up seller profile
+              </Link>
             </div>
-          ) : null}
+          )}
         </aside>
       </section>
     </div>
