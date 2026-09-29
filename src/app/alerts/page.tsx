@@ -1,24 +1,36 @@
 import Link from "next/link";
-import { readDb } from "@/lib/db";
-import { getCurrentUser } from "@/lib/session";
+import { desc, eq } from "drizzle-orm";
+import * as s from "@/db/schema";
+import { db, expireWants } from "@/lib/db";
+import { requireUser } from "@/lib/session";
 import { conditionLabel, money, timeAgo } from "@/lib/format";
 import { StatusBadge } from "@/components/ui";
 import { updateInterests } from "@/app/actions";
 
 export default async function AlertsPage() {
-  const [db, user] = await Promise.all([readDb(), getCurrentUser()]);
+  const user = await requireUser("/alerts");
 
-  if (user.role !== "seller") {
+  if (!user.seller) {
     return (
-      <div className="panel mx-auto max-w-lg p-8 text-center text-ink-muted">
-        Alerts are for seller accounts. Switch to a seller in the header.
+      <div className="panel mx-auto max-w-lg space-y-3 p-8 text-center">
+        <h1 className="text-xl font-semibold">Alerts are for sellers</h1>
+        <p className="text-ink-muted">
+          Set up your seller profile to get alerted when buyers post the cards you sell.
+        </p>
+        <Link href="/seller/setup?next=/alerts" className="btn-primary">
+          Set up seller profile
+        </Link>
       </div>
     );
   }
 
-  const alerts = db.alerts
-    .filter((a) => a.sellerId === user.id)
-    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  await expireWants();
+  const alerts = await db
+    .select({ alert: s.alert, want: s.want })
+    .from(s.alert)
+    .innerJoin(s.want, eq(s.want.id, s.alert.wantId))
+    .where(eq(s.alert.sellerId, user.id))
+    .orderBy(desc(s.alert.createdAt));
 
   return (
     <div className="grid gap-8 lg:grid-cols-[1fr_320px]">
@@ -31,30 +43,26 @@ export default async function AlertsPage() {
           </div>
         ) : (
           <ul className="space-y-3">
-            {alerts.map((a) => {
-              const want = db.wants.find((w) => w.id === a.wantId);
-              if (!want) return null;
-              return (
-                <li key={a.id}>
-                  <Link
-                    href={`/wants/${want.id}`}
-                    className="panel flex flex-wrap items-center gap-3 p-4 hover:shadow-md"
-                  >
-                    {!a.read && <span className="size-2 rounded-full bg-brand" aria-label="New" />}
-                    <div className="min-w-0 flex-1">
-                      <div className="font-medium">
-                        {want.cardName} <span className="text-ink-muted">· {want.setName}</span>
-                      </div>
-                      <div className="text-sm text-ink-muted">
-                        {conditionLabel(want.condition)} · budget {money(want.priceMin)}–
-                        {money(want.priceMax)} · matched “{a.matchedOn}” · {timeAgo(a.createdAt)}
-                      </div>
+            {alerts.map(({ alert: a, want }) => (
+              <li key={a.id}>
+                <Link
+                  href={`/wants/${want.id}`}
+                  className="panel flex flex-wrap items-center gap-3 p-4 hover:shadow-md"
+                >
+                  {!a.read && <span className="size-2 rounded-full bg-brand" aria-label="New" />}
+                  <div className="min-w-0 flex-1">
+                    <div className="font-medium">
+                      {want.cardName} <span className="text-ink-muted">· {want.setName}</span>
                     </div>
-                    <StatusBadge status={want.status} />
-                  </Link>
-                </li>
-              );
-            })}
+                    <div className="text-sm text-ink-muted">
+                      {conditionLabel(want.condition)} · budget {money(want.priceMin)}–
+                      {money(want.priceMax)} · matched “{a.matchedOn}” · {timeAgo(a.createdAt)}
+                    </div>
+                  </div>
+                  <StatusBadge status={want.status} />
+                </Link>
+              </li>
+            ))}
           </ul>
         )}
       </section>
@@ -66,12 +74,7 @@ export default async function AlertsPage() {
             Comma-separated keywords. A new want alerts you when its card name or set contains one.
             Local-preferred wants only alert sellers in the buyer&apos;s state.
           </p>
-          <textarea
-            name="interests"
-            rows={4}
-            defaultValue={(user.interests ?? []).join(", ")}
-            className="input"
-          />
+          <textarea name="interests" rows={4} defaultValue={user.seller.interests.join(", ")} className="input" />
           <button className="btn-primary">Save</button>
         </form>
       </aside>

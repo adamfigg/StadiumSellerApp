@@ -1,17 +1,25 @@
 "use server";
 
-import { promises as fs } from "fs";
-import { cookies } from "next/headers";
+import { and, eq, isNull, ne } from "drizzle-orm";
+import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
-import { mutateDb, newId, UPLOAD_DIR, uploadPath } from "@/lib/db";
-import { getCurrentUser, USER_COOKIE } from "@/lib/session";
+import { isAPIError } from "better-auth/api";
+import * as s from "@/db/schema";
+import { auth } from "@/lib/auth";
+import { db, dbReady, newId } from "@/lib/db";
+import { DEMO_PASSWORD, DEMO_USERS } from "@/lib/seed";
+import { getCurrentUser, TEST_TOOLS } from "@/lib/session";
+import { matchInterest } from "@/lib/matching";
+import { safeNext } from "@/lib/safe-next";
+import { VIEW_MODE_COOKIE, type ViewMode } from "@/lib/view-mode";
+import { isUsState } from "@/lib/states";
 import { getCard } from "@/lib/tcgdex";
 import {
   GRADING_COMPANIES,
   RAW_CONDITIONS,
   type CardCondition,
-  type Database,
+  type SellerType,
   type Want,
 } from "@/lib/types";
 
@@ -20,57 +28,141 @@ export type FormState = { error?: string } | undefined;
 const str = (fd: FormData, key: string) => String(fd.get(key) ?? "").trim();
 const num = (fd: FormData, key: string) => Number(str(fd, key));
 
-export async function switchUser(formData: FormData) {
-  (await cookies()).set(USER_COOKIE, str(formData, "userId"), { path: "/" });
+const authError = (e: unknown, fallback: string) => ({ error: isAPIError(e) ? e.message : fallback });
+
+/* ---------- Accounts ---------- */
+
+/** Step 1 of sign-up: every account starts as a buyer. */
+export async function signUp(_prev: FormState, formData: FormData): Promise<FormState> {
+  const name = str(formData, "name");
+  const email = str(formData, "email").toLowerCase();
+  const password = String(formData.get("password") ?? "");
+  const city = str(formData, "city");
+  const state = str(formData, "state");
+
+  if (!name || !email) return { error: "Enter your name and email." };
+  if (password.length < 8) return { error: "Password must be at least 8 characters." };
+  if (!city || !isUsState(state)) return { error: "Enter your city and pick a state." };
+
+  await dbReady();
+  try {
+    await auth.api.signUpEmail({ body: { name, email, password, city, state }, headers: await headers() });
+  } catch (e) {
+    return authError(e, "Couldn't create your account. Try again.");
+  }
+  revalidatePath("/", "layout");
+  const next = safeNext(str(formData, "next"));
+  redirect(next ? `/signup/welcome?next=${encodeURIComponent(next)}` : "/signup/welcome");
+}
+
+export async function signIn(_prev: FormState, formData: FormData): Promise<FormState> {
+  await dbReady();
+  try {
+    await auth.api.signInEmail({
+      body: { email: str(formData, "email").toLowerCase(), password: String(formData.get("password") ?? "") },
+      headers: await headers(),
+    });
+  } catch (e) {
+    return authError(e, "Couldn't sign you in. Try again.");
+  }
+  revalidatePath("/", "layout");
+  redirect(safeNext(str(formData, "next")) ?? "/");
+}
+
+export async function signOut() {
+  await auth.api.signOut({ headers: await headers() });
+  revalidatePath("/", "layout");
+  redirect("/");
+}
+
+/** Step 2 of sign-up (or later from the account menu): opt in to selling. */
+export async function setupSeller(_prev: FormState, formData: FormData): Promise<FormState> {
+  const user = await getCurrentUser();
+  if (!user) return { error: "Sign in first." };
+
+  const sellerType: SellerType = str(formData, "sellerType") === "company" ? "company" : "individual";
+  const businessName = str(formData, "businessName");
+  if (sellerType === "company" && !businessName) return { error: "Enter your business name." };
+  const interests = parseInterests(str(formData, "interests"));
+
+  const values = {
+    sellerType,
+    businessName: sellerType === "company" ? businessName : null,
+    interests,
+  };
+  await db
+    .insert(s.sellerProfile)
+    .values({ userId: user.id, ...values })
+    .onConflictDoUpdate({ target: s.sellerProfile.userId, set: values });
+
+  revalidatePath("/", "layout");
+  redirect(safeNext(str(formData, "next")) ?? "/alerts");
+}
+
+/** Header Buying / Selling toggle. Selling view needs a seller profile. */
+export async function setViewMode(formData: FormData) {
+  const mode: ViewMode = str(formData, "mode") === "selling" ? "selling" : "buying";
+  (await cookies()).set(VIEW_MODE_COOKIE, mode, { path: "/", sameSite: "lax", maxAge: 60 * 60 * 24 * 365 });
+  revalidatePath("/", "layout");
+}
+
+/* ---------- Test tools (dev, or STADIUM_TEST_TOOLS=1) ---------- */
+
+/** Header "Test sign up": sign out and start the new-visitor sign-up flow. */
+export async function testSignUp() {
+  if (!TEST_TOOLS) return;
+  await auth.api.signOut({ headers: await headers() }).catch(() => undefined);
+  revalidatePath("/", "layout");
+  redirect("/signup");
+}
+
+/** Header demo switcher: sign in as a seeded account, or sign out for "Visitor". */
+export async function demoSignIn(formData: FormData) {
+  if (!TEST_TOOLS) return;
+  await dbReady();
+  const demo = DEMO_USERS.find((u) => u.id === str(formData, "userId"));
+  const hdrs = await headers();
+  if (demo) {
+    await auth.api.signInEmail({ body: { email: demo.email, password: DEMO_PASSWORD }, headers: hdrs });
+  } else {
+    await auth.api.signOut({ headers: hdrs }).catch(() => undefined);
+  }
   revalidatePath("/", "layout");
 }
 
 /* ---------- Buyer: post a want ---------- */
 
-const ALLOWED_IMAGE_TYPES: Record<string, string> = {
-  "image/jpeg": ".jpg",
-  "image/png": ".png",
-  "image/webp": ".webp",
-};
-
-async function saveImage(file: File | null): Promise<string | undefined> {
-  if (!file || file.size === 0) return undefined;
-  const ext = ALLOWED_IMAGE_TYPES[file.type];
-  if (!ext) throw new Error("Photo must be a JPG, PNG or WebP.");
-  if (file.size > 5 * 1024 * 1024) throw new Error("Photo must be under 5 MB.");
-  await fs.mkdir(UPLOAD_DIR, { recursive: true });
-  const name = `${crypto.randomUUID()}${ext}`;
-  await fs.writeFile(uploadPath(name), Buffer.from(await file.arrayBuffer()));
-  return `/api/uploads/${name}`;
+function parseInterests(raw: string) {
+  const words = raw
+    .split(",")
+    .map((w) => w.trim().toLowerCase())
+    .filter(Boolean);
+  return [...new Set(words)];
 }
 
 /** Sends an alert to each seller whose interests match the new want. */
-function queueSellerAlerts(db: Database, want: Want) {
-  const haystack = `${want.cardName} ${want.setName}`.toLowerCase();
-  for (const seller of db.users.filter((u) => u.role === "seller")) {
-    if (want.scope === "local" && seller.location.state !== want.location.state) continue;
-    const hit = seller.interests?.find((k) => haystack.includes(k.toLowerCase()));
-    if (!hit) continue;
-    db.alerts.push({
-      id: newId("a"),
-      sellerId: seller.id,
-      wantId: want.id,
-      matchedOn: hit,
-      createdAt: new Date().toISOString(),
-      read: false,
-    });
-  }
+async function queueSellerAlerts(want: Want) {
+  const sellers = await db
+    .select({ userId: s.sellerProfile.userId, interests: s.sellerProfile.interests, state: s.user.state })
+    .from(s.sellerProfile)
+    .innerJoin(s.user, eq(s.user.id, s.sellerProfile.userId))
+    .where(ne(s.sellerProfile.userId, want.buyerId));
+  const alerts = sellers.flatMap((seller) => {
+    const hit = matchInterest(want, seller);
+    return hit ? [{ id: newId("a"), sellerId: seller.userId, wantId: want.id, matchedOn: hit }] : [];
+  });
+  if (alerts.length) await db.insert(s.alert).values(alerts);
 }
 
 export async function createWant(_prev: FormState, formData: FormData): Promise<FormState> {
   const user = await getCurrentUser();
-  if (user.role !== "buyer") return { error: "Only buyer accounts can post wants." };
+  if (!user) return { error: "Sign up or sign in to post a want." };
 
   const cardName = str(formData, "cardName");
   const setName = str(formData, "setName");
   const priceMin = num(formData, "priceMin");
   const priceMax = num(formData, "priceMax");
-  const days = Math.min(14, Math.max(1, num(formData, "days") || 3));
+  const days = Math.min(7, Math.max(1, num(formData, "days") || 3));
 
   if (!cardName || !setName) return { error: "Card name and set are required." };
   if (!(priceMin >= 0) || !(priceMax > 0) || priceMin > priceMax)
@@ -89,44 +181,35 @@ export async function createWant(_prev: FormState, formData: FormData): Promise<
     condition = { kind: "raw", condition: c };
   }
 
-  let imagePath: string | undefined;
-  try {
-    imagePath = await saveImage(formData.get("photo") as File | null);
-  } catch (e) {
-    return { error: (e as Error).message };
-  }
-
   // If the buyer picked a card from search, re-fetch it server-side for the official image and market price.
   const tcgCardId = str(formData, "tcgCardId");
   const card = tcgCardId ? await getCard(tcgCardId) : undefined;
 
   const now = new Date();
-  const want: Want = {
-    id: newId("w"),
-    buyerId: user.id,
-    cardName,
-    setName,
-    cardNumber: str(formData, "cardNumber") || undefined,
-    description: str(formData, "description"),
-    imagePath,
-    tcgCardId: card?.id,
-    officialImage: card?.image,
-    rarity: card?.rarity,
-    marketPrice: card?.marketPrice,
-    condition,
-    priceMin,
-    priceMax,
-    scope: str(formData, "scope") === "local" ? "local" : "nationwide",
-    location: user.location,
-    status: "open",
-    createdAt: now.toISOString(),
-    expiresAt: new Date(now.getTime() + days * 86_400_000).toISOString(),
-  };
-
-  await mutateDb((db) => {
-    db.wants.push(want);
-    queueSellerAlerts(db, want);
-  });
+  const [want] = await db
+    .insert(s.want)
+    .values({
+      id: newId("w"),
+      buyerId: user.id,
+      cardName,
+      setName,
+      cardNumber: str(formData, "cardNumber") || null,
+      description: str(formData, "description"),
+      tcgCardId: card?.id,
+      officialImage: card?.image,
+      rarity: card?.rarity,
+      marketPrice: card?.marketPrice,
+      condition,
+      priceMin,
+      priceMax,
+      scope: str(formData, "scope") === "local" ? "local" : "nationwide",
+      city: user.city,
+      state: user.state,
+      createdAt: now,
+      expiresAt: new Date(now.getTime() + days * 86_400_000),
+    })
+    .returning();
+  await queueSellerAlerts(want);
 
   revalidatePath("/");
   redirect(`/wants/${want.id}`);
@@ -136,7 +219,8 @@ export async function createWant(_prev: FormState, formData: FormData): Promise<
 
 export async function createOffer(_prev: FormState, formData: FormData): Promise<FormState> {
   const user = await getCurrentUser();
-  if (user.role !== "seller") return { error: "Switch to a seller account to make an offer." };
+  if (!user) return { error: "Sign up or sign in to make an offer." };
+  if (!user.seller) return { error: "Set up your seller profile to make offers." };
 
   const wantId = str(formData, "wantId");
   const price = num(formData, "price");
@@ -145,16 +229,18 @@ export async function createOffer(_prev: FormState, formData: FormData): Promise
   if (!(price > 0)) return { error: "Enter an offer price." };
   if (shipping < 0) return { error: "Shipping can't be negative." };
 
-  const error = await mutateDb((db) => {
-    const want = db.wants.find((w) => w.id === wantId);
+  const error = await db.transaction(async (tx) => {
+    const [want] = await tx.select().from(s.want).where(eq(s.want.id, wantId)).for("update");
     if (!want) return "That post no longer exists.";
-    if (want.status !== "open") return "This post isn't taking offers right now.";
-    const now = new Date().toISOString();
+    if (want.buyerId === user.id) return "You can't make an offer on your own post.";
+    if (want.status !== "open" || want.expiresAt <= new Date()) return "This post isn't taking offers right now.";
+    const now = new Date();
     // A seller's newest offer replaces their previous one, but the old one stays public.
-    for (const o of db.offers) {
-      if (o.wantId === wantId && o.sellerId === user.id && !o.supersededAt) o.supersededAt = now;
-    }
-    db.offers.push({
+    await tx
+      .update(s.offer)
+      .set({ supersededAt: now })
+      .where(and(eq(s.offer.wantId, wantId), eq(s.offer.sellerId, user.id), isNull(s.offer.supersededAt)));
+    await tx.insert(s.offer).values({
       id: newId("o"),
       wantId,
       sellerId: user.id,
@@ -164,9 +250,10 @@ export async function createOffer(_prev: FormState, formData: FormData): Promise
       message: str(formData, "message"),
       createdAt: now,
     });
-    db.alerts.forEach((a) => {
-      if (a.wantId === wantId && a.sellerId === user.id) a.read = true;
-    });
+    await tx
+      .update(s.alert)
+      .set({ read: true })
+      .where(and(eq(s.alert.wantId, wantId), eq(s.alert.sellerId, user.id)));
   });
   if (error) return { error };
 
@@ -177,13 +264,16 @@ export async function createOffer(_prev: FormState, formData: FormData): Promise
 
 /* ---------- Buyer: move a post through its states ---------- */
 
-async function updateOwnWant(wantId: string, fn: (w: Want) => string | void) {
+async function updateOwnWant(wantId: string, fn: (w: Want) => Partial<Want> | string) {
   const user = await getCurrentUser();
-  const error = await mutateDb((db) => {
-    const want = db.wants.find((w) => w.id === wantId);
+  if (!user) throw new Error("Sign in first.");
+  const error = await db.transaction(async (tx) => {
+    const [want] = await tx.select().from(s.want).where(eq(s.want.id, wantId)).for("update");
     if (!want) return "Post not found.";
     if (want.buyerId !== user.id) return "Only the buyer can change this post.";
-    return fn(want) ?? undefined;
+    const change = fn(want);
+    if (typeof change === "string") return change;
+    await tx.update(s.want).set(change).where(eq(s.want.id, wantId));
   });
   if (error) throw new Error(error);
   revalidatePath(`/wants/${wantId}`);
@@ -192,53 +282,45 @@ async function updateOwnWant(wantId: string, fn: (w: Want) => string | void) {
 
 export async function acceptOffer(formData: FormData) {
   const offerId = str(formData, "offerId");
-  await updateOwnWant(str(formData, "wantId"), (w) => {
-    if (w.status !== "open") return "Offers can only be accepted while the post is open.";
-    w.status = "pending";
-    w.acceptedOfferId = offerId;
-  });
+  await updateOwnWant(str(formData, "wantId"), (w) =>
+    w.status !== "open"
+      ? "Offers can only be accepted while the post is open."
+      : { status: "pending", acceptedOfferId: offerId },
+  );
 }
 
 export async function markSold(formData: FormData) {
-  await updateOwnWant(str(formData, "wantId"), (w) => {
-    if (w.status !== "pending") return "Only pending posts can be marked sold.";
-    w.status = "sold";
-    w.closedReason = "sold";
-    w.closedAt = new Date().toISOString();
-  });
+  await updateOwnWant(str(formData, "wantId"), (w) =>
+    w.status !== "pending"
+      ? "Only pending posts can be marked sold."
+      : { status: "sold", closedReason: "sold", closedAt: new Date() },
+  );
 }
 
 export async function reopenWant(formData: FormData) {
   await updateOwnWant(str(formData, "wantId"), (w) => {
     if (w.status !== "pending") return "Only pending posts can be reopened.";
-    if (Date.parse(w.expiresAt) <= Date.now()) return "This post has expired.";
-    w.status = "open";
-    w.acceptedOfferId = undefined;
+    if (w.expiresAt <= new Date()) return "This post has expired.";
+    return { status: "open", acceptedOfferId: null };
   });
 }
 
 export async function closeNoDeal(formData: FormData) {
-  await updateOwnWant(str(formData, "wantId"), (w) => {
-    if (w.status === "sold" || w.status === "no_deal") return "This post is already closed.";
-    w.status = "no_deal";
-    w.closedReason = "buyer_closed";
-    w.acceptedOfferId = undefined;
-    w.closedAt = new Date().toISOString();
-  });
+  await updateOwnWant(str(formData, "wantId"), (w) =>
+    w.status === "sold" || w.status === "no_deal"
+      ? "This post is already closed."
+      : { status: "no_deal", closedReason: "buyer_closed", acceptedOfferId: null, closedAt: new Date() },
+  );
 }
 
 /* ---------- Seller: alert settings ---------- */
 
 export async function updateInterests(formData: FormData) {
   const user = await getCurrentUser();
-  if (user.role !== "seller") return;
-  const interests = str(formData, "interests")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  await mutateDb((db) => {
-    const u = db.users.find((x) => x.id === user.id);
-    if (u) u.interests = [...new Set(interests)];
-  });
+  if (!user?.seller) return;
+  await db
+    .update(s.sellerProfile)
+    .set({ interests: parseInterests(str(formData, "interests")) })
+    .where(eq(s.sellerProfile.userId, user.id));
   revalidatePath("/alerts");
 }

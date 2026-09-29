@@ -1,5 +1,6 @@
 import type { Want, WantStatus } from "@/lib/types";
 import { STATUS_LABEL } from "@/lib/format";
+import { ZoomImage } from "./ZoomImage";
 
 const STATUS_STYLE: Record<WantStatus, string> = {
   open: "bg-open-soft text-open",
@@ -23,13 +24,13 @@ export function ScopeBadge({ want }: { want: Want }) {
   return (
     <span className="inline-flex rounded-full border border-line px-2.5 py-0.5 text-xs text-ink-muted">
       {want.scope === "local"
-        ? `Local preferred · ${want.location.city}, ${want.location.state}`
+        ? `Local preferred · ${want.city}, ${want.state}`
         : "Nationwide"}
     </span>
   );
 }
 
-/** Official card image when linked to TCGdex, else the buyer's photo, else a card-shaped placeholder. */
+/** Official card image when linked to TCGdex, else a card-shaped placeholder. */
 export function CardArt({
   want,
   size = "high",
@@ -39,12 +40,11 @@ export function CardArt({
   size?: "low" | "high";
   className?: string;
 }) {
-  const src = want.officialImage ? `${want.officialImage}/${size}.webp` : want.imagePath;
-  if (src) {
+  if (want.officialImage) {
     return (
-      // eslint-disable-next-line @next/next/no-img-element -- external TCGdex CDN and local uploads
-      <img
-        src={src}
+      <ZoomImage
+        src={`${want.officialImage}/${size}.webp`}
+        zoomSrc={`${want.officialImage}/high.webp`}
         alt={want.cardName}
         loading="lazy"
         className={`aspect-[5/7] w-full rounded-lg object-cover shadow-sm ${className}`}
@@ -59,7 +59,7 @@ export function CardArt({
         {want.setName}
       </span>
       <span className="text-sm font-semibold leading-tight text-ink">{want.cardName}</span>
-      <span className="text-[10px] text-ink-muted">No photo</span>
+      <span className="text-[10px] text-ink-muted">No image</span>
     </div>
   );
 }

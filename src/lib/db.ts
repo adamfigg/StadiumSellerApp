@@ -1,80 +1,77 @@
 import "server-only";
-import { promises as fs } from "fs";
 import path from "path";
-import type { Database } from "./types";
-import { buildSeed } from "./seed";
+import { and, eq, lte, sql } from "drizzle-orm";
+import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
+import * as schema from "@/db/schema";
+import { seed, SEED_VERSION } from "./seed";
 
 /**
- * Tiny JSON-file store so the base version runs with zero setup.
- * Everything goes through readDb / mutateDb, so swapping in a real
- * database (Postgres + Prisma/Drizzle) later only touches this file.
+ * Postgres through Drizzle.
+ * - `DATABASE_URL` set → a real Postgres server (Neon, Supabase, RDS, local install…).
+ * - Not set → PGlite: real Postgres compiled to WASM, running in-process and stored in
+ *   `data/pglite`, so local dev needs no install. Same schema, same SQL.
+ * Migrations live in `drizzle/` (`npm run db:generate` after editing src/db/schema.ts)
+ * and are applied automatically on first use.
  */
 
-// Paths are written out in full so Next's file tracing stays scoped to ./data.
-export const DATA_DIR = path.join(process.cwd(), "data");
-export const UPLOAD_DIR = path.join(process.cwd(), "data", "uploads");
-const DB_FILE = path.join(process.cwd(), "data", "db.json");
-export const uploadPath = (name: string) => path.join(process.cwd(), "data", "uploads", name);
+export type Db = PgDatabase<PgQueryResultHKT, typeof schema>;
 
-let queue: Promise<unknown> = Promise.resolve();
+const MIGRATIONS = path.join(process.cwd(), "drizzle");
 
-async function load(): Promise<Database> {
-  try {
-    const raw = await fs.readFile(DB_FILE, "utf8");
-    return JSON.parse(raw) as Database;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    const seed = buildSeed();
-    await save(seed);
-    return seed;
+type State = { db: Db; ready?: Promise<void>; readyFor?: number; migrate: () => Promise<void> };
+
+function connect(): State {
+  const url = process.env.DATABASE_URL;
+  if (url) {
+    /* eslint-disable @typescript-eslint/no-require-imports -- pick the driver at runtime */
+    const { Pool } = require("pg") as typeof import("pg");
+    const { drizzle } = require("drizzle-orm/node-postgres") as typeof import("drizzle-orm/node-postgres");
+    const { migrate } = require("drizzle-orm/node-postgres/migrator") as typeof import("drizzle-orm/node-postgres/migrator");
+    const db = drizzle(new Pool({ connectionString: url }), { schema });
+    return { db, migrate: () => migrate(db, { migrationsFolder: MIGRATIONS }) };
   }
+  const { PGlite } = require("@electric-sql/pglite") as typeof import("@electric-sql/pglite");
+  const { drizzle } = require("drizzle-orm/pglite") as typeof import("drizzle-orm/pglite");
+  const { migrate } = require("drizzle-orm/pglite/migrator") as typeof import("drizzle-orm/pglite/migrator");
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  const db = drizzle(new PGlite(path.join(process.cwd(), "data", "pglite")), { schema });
+  return { db: db as unknown as Db, migrate: () => migrate(db, { migrationsFolder: MIGRATIONS }) };
 }
 
-async function save(db: Database) {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  const tmp = `${DB_FILE}.${process.pid}.${Date.now()}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(db, null, 2), "utf8");
-  await fs.rename(tmp, DB_FILE);
-}
+// One connection per process, surviving dev hot reloads (PGlite allows a single opener per folder).
+const g = globalThis as unknown as { __stadiumDb?: State };
+const state = (g.__stadiumDb ??= connect());
 
-/** Closes open wants whose public window has passed. */
-function expireWants(db: Database): boolean {
-  const now = Date.now();
-  let changed = false;
-  for (const want of db.wants) {
-    if (want.status === "open" && Date.parse(want.expiresAt) <= now) {
-      want.status = "no_deal";
-      want.closedReason = "expired";
-      want.closedAt = want.expiresAt;
-      changed = true;
-    }
-  }
-  return changed;
-}
+export const db = state.db;
 
-/** Every read and write goes through one queue, so first-run seeding and concurrent actions can't race. */
-function enqueue<T>(job: () => Promise<T>): Promise<T> {
-  const run = queue.then(job);
-  queue = run.catch(() => undefined);
-  return run;
-}
+// Demo data is topped up on every start in dev (or with STADIUM_TEST_TOOLS=1); otherwise only an empty database is seeded.
+const DEMO_DATA = process.env.NODE_ENV !== "production" || process.env.STADIUM_TEST_TOOLS === "1";
 
-export function readDb(): Promise<Database> {
-  return enqueue(async () => {
-    const db = await load();
-    if (expireWants(db)) await save(db);
-    return db;
+/**
+ * Runs migrations and seeds demo data once per process (and again in dev when SEED_VERSION
+ * changes, so new demo data appears without a restart). Await before touching the database.
+ */
+export function dbReady(): Promise<void> {
+  if (state.readyFor !== SEED_VERSION) state.ready = undefined;
+  state.readyFor = SEED_VERSION;
+  state.ready ??= (async () => {
+    await state.migrate();
+    const [{ count }] = await db.select({ count: sql<number>`count(*)::int` }).from(schema.user);
+    if (count === 0 || DEMO_DATA) await seed(db);
+  })().catch((err) => {
+    state.ready = undefined; // let the next request retry
+    throw err;
   });
+  return state.ready;
 }
 
-export function mutateDb<T>(fn: (db: Database) => T | Promise<T>): Promise<T> {
-  return enqueue(async () => {
-    const db = await load();
-    expireWants(db);
-    const result = await fn(db);
-    await save(db);
-    return result;
-  });
+/** Closes open wants whose public window has passed. Call before reading wants. */
+export async function expireWants() {
+  await dbReady();
+  await db
+    .update(schema.want)
+    .set({ status: "no_deal", closedReason: "expired", closedAt: sql`${schema.want.expiresAt}` })
+    .where(and(eq(schema.want.status, "open"), lte(schema.want.expiresAt, sql`now()`)));
 }
 
 export function newId(prefix: string) {
